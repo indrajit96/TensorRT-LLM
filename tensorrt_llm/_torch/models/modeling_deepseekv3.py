@@ -1902,9 +1902,11 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                     idx + 1].input_layernorm
 
 
-@register_auto_model("KimiK25ForConditionalGeneration")
+# NOTE: The ``KimiK25ForConditionalGeneration`` architecture name is now
+# registered by ``modeling_kimi_k25.KimiK25Model`` which adds vision encoder
+# support.  This text-only class is kept for reference / direct instantiation.
 class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
-    """Kimi-K2.5 multimodal model (text-only path).
+    """Kimi-K2.5 text-only path (DeepSeek-V3 backbone).
 
     Extracts the DeepSeek-V3 text backbone from the composite config
     and strips the ``language_model.`` weight prefix so that the
@@ -1912,6 +1914,9 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
 
     NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
     so MTP-based speculative decoding is not applicable to this model.
+
+    For the full multimodal model (vision + text), see
+    ``modeling_kimi_k25.KimiK25Model``.
     """
 
     _LANG_PREFIX = "language_model."

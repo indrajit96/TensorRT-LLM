@@ -15,6 +15,7 @@ from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
+from .modeling_kimi_k25 import KimiK25Model
 from .modeling_llava_next import LlavaNextModel
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
@@ -54,6 +55,7 @@ __all__ = [
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",
     "LlamaForCausalLM",
+    "KimiK25Model",
     "LlavaNextModel",
     "Mistral3VLM",
     "MistralForCausalLM",
