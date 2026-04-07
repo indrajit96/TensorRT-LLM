@@ -12,8 +12,9 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
-                                                         load_pretrained_config)
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
+    load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
@@ -130,6 +131,9 @@ class ModelConfig(Generic[TConfig]):
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
+
+    # Video pruning rate for VLM models (None = EVS disabled)
+    video_pruning_rate: Optional[float] = None
 
     def __setattr__(self, key, value):
         """
@@ -530,14 +534,18 @@ class ModelConfig(Generic[TConfig]):
                         index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                        use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
+                        enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
                         index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = None
                         skip_indexer_for_short_seqs = True
+                        use_cute_dsl_topk = False
                         q_split_threshold = 8192
+                        enable_heuristic_topk = False
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -546,8 +554,10 @@ class ModelConfig(Generic[TConfig]):
                             indexer_max_chunk_size=indexer_max_chunk_size,
                             skip_indexer_for_short_seqs=
                             skip_indexer_for_short_seqs,
+                            use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
-                            indexer_rope_interleave=indexer_rope_interleave)
+                            indexer_rope_interleave=indexer_rope_interleave,
+                            enable_heuristic_topk=enable_heuristic_topk)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -661,10 +671,13 @@ class ModelConfig(Generic[TConfig]):
         attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1
         attn_cp_size = self.mapping.attn_cp_size
 
-        num_heads = self.pretrained_config.num_attention_heads // (
-            attn_tp_size * attn_cp_size)
+        def ceil_div(a, b):
+            return (a + b - 1) // b
 
-        hidden_size = self.pretrained_config.hidden_size // attn_tp_size
+        num_heads = ceil_div(self.pretrained_config.num_attention_heads,
+                             attn_tp_size * attn_cp_size)
+
+        hidden_size = ceil_div(self.pretrained_config.hidden_size, attn_tp_size)
         num_layers = self.pretrained_config.num_hidden_layers
         num_attention_layers = self.get_num_attention_layers()
         if (self.spec_config is not None
@@ -695,17 +708,25 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
-                kv_heads // (attn_tp_size * attn_cp_size)
+                ceil_div(kv_heads, attn_tp_size * attn_cp_size)
                 for kv_heads in num_key_value_heads
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = num_key_value_heads // (attn_tp_size * attn_cp_size)
+            num_kv_heads = ceil_div(num_key_value_heads,
+                                    attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
+
+        # For hybrid models (e.g., Nemotron-H with Mamba + Attention), LoRA can be applied
+        # to non-attention layers (e.g., Mamba in_proj/out_proj). Set num_lora_layers to
+        # total layers so the C++ LoRA validation accepts all layer indices.
+        if is_nemotron_hybrid(self.pretrained_config):
+            model_config_cpp.set_num_lora_layers(num_layers)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
-            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+            mlp_hidden_size = ceil_div(self.pretrained_config.intermediate_size,
+                                       self.mapping.tp_size)
         else:
             # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
             # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file
@@ -714,8 +735,8 @@ class ModelConfig(Generic[TConfig]):
                 architectures = self.pretrained_config.architectures
                 if len(architectures
                        ) == 1 and architectures[0] == "DeciLMForCausalLM":
-                    mlp_hidden_size = self._infer_nemotron_ffn_mult(
-                    ) // self.mapping.tp_size
+                    mlp_hidden_size = ceil_div(self._infer_nemotron_ffn_mult(),
+                                               self.mapping.tp_size)
                 else:
                     raise ValueError(
                         f"Inferring mlp hidden size for model architecture: {architectures} isn't supported yet"
@@ -790,12 +811,7 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif hasattr(
-                self.pretrained_config, "architectures"
-        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
-                0] in ["Qwen3NextForCausalLM"]:
-            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
-            # we need to calculate the number of fullattention layers
-            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
+        elif is_qwen3_hybrid(self.pretrained_config):
+            return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
         else:
             return self.pretrained_config.num_hidden_layers

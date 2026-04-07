@@ -13,9 +13,10 @@ from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import is_llm_response
+from .utils import ErrorResponse, is_llm_response
 
 if TYPE_CHECKING:
+    from ..disaggregated_params import DisaggregatedParams
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
                          GenerationResultBase, ResponseWrapper)
 
@@ -61,6 +62,7 @@ class PostprocWorker:
         # The information necessary for creating a GenerationResult in the first Input for each request
         sampling_params: Optional[SamplingParams] = None
         postproc_params: Optional[PostprocParams] = None
+        disaggregated_params: Optional["DisaggregatedParams"] = None
         streaming: Optional[bool] = None
 
     class Output(NamedTuple):
@@ -139,6 +141,9 @@ class PostprocWorker:
                 # TODO: support variant creation later
                 self._records[req_id] = self._record_creator(
                     input, self._tokenizer)
+                if input.disaggregated_params is not None:
+                    self._records[
+                        req_id]._disaggregated_params = input.disaggregated_params
 
             record = self._records[req_id]
             record._handle_response(input.rsp)  # inplace
@@ -182,6 +187,12 @@ class PostprocWorker:
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
             client_id = inp.rsp.client_id
+            # ErrorResponse has no 'result' attribute; pass it through
+            # directly so the proxy handles it via its ErrorResponse path.
+            if isinstance(inp.rsp, ErrorResponse):
+                batch.append(inp.rsp)
+                self._records.pop(client_id, None)
+                return
             is_final = inp.rsp.result.is_final if is_llm_response(
                 inp.rsp) else True
             res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
