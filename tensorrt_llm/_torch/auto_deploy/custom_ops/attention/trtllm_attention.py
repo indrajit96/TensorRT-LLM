@@ -82,6 +82,9 @@ class _TrtllmPlanner:
         # keeping a separate copy here since we sometimes have to overwrite the original values
         self.host_past_kv_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
         self.host_context_lengths: Optional[torch.Tensor] = None  # [max_batch] int32 pinned
+        # Batch counts for thop.attention (updated every forward in plan_host)
+        self.num_contexts: int = 0
+        self.num_ctx_tokens: int = 0
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
@@ -170,6 +173,10 @@ class _TrtllmPlanner:
         (including CUDA graph replays).
         """
         num_seq = num_prefill + num_decode
+
+        # Batch counts for thop.attention
+        self.num_contexts = num_prefill
+        self.num_ctx_tokens = int(seq_len_host[:num_prefill].sum()) if num_prefill > 0 else 0
 
         # host_request_types: 0 = prefill (context), 1 = decode (generation)
         self.host_request_types[:num_prefill].fill_(0)
@@ -500,6 +507,10 @@ def trtllm_mha_with_cache(
         None,  # mla_bmm1_scale
         None,  # mla_bmm2_scale
         None,  # quant_q_buffer
+        None,  # flash_mla_tile_scheduler_metadata
+        None,  # flash_mla_num_splits
+        num_contexts=_GlobalTrtllmPlanner.num_contexts,
+        num_ctx_tokens=_GlobalTrtllmPlanner.num_ctx_tokens,
     )
 
     if out is not None:
@@ -639,13 +650,7 @@ class TrtllmAttention(AttentionDescriptor):
         from tensor shapes or SequenceInfo metadata at runtime.
         """
         # Sanity check: layout == "bsnd"
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
