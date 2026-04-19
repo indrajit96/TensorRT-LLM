@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
@@ -256,6 +257,96 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor,
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
+    # -- Tokenized+MM fast path (Dynamo / serving) ---------------------------
+
+    def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
+        """Return minimal dummy text so the HF processor can run vision-only.
+
+        The ``tokenized_multimodal_process`` pipeline calls ``__call__`` with
+        this dummy text + the real PIL images to obtain ``pixel_values`` /
+        ``grid_thws`` without re-tokenising the actual prompt.
+        """
+        num_images = mm_counts.get("image", 0)
+        placeholder = getattr(self.config, "media_placeholder_token",
+                              "<|media_placeholder|>")
+        return placeholder * num_images
+
+    def get_num_tokens_per_image(
+        self, *, image: Image.Image, **kwargs
+    ) -> int:
+        """Compute the number of LLM tokens one image produces after merge.
+
+        Runs the HF processor on a single image to obtain ``grid_thws``,
+        then applies the merge-kernel downsampling formula.
+        """
+        processed = self.processor(
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": image},
+                {"type": "text", "text": "x"},
+            ]}],
+            return_tensors="pt",
+        )
+        grid_thws = processed.get(
+            'grid_thws', processed.get('image_grid_thw'))
+        merge_k = getattr(
+            self.config.vision_config, 'merge_kernel_size', [2, 2])
+        _, h, w = grid_thws[0].tolist()
+        return (h // merge_k[0]) * (w // merge_k[1])
+
+    def _expand_image_placeholders_in_token_ids(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Replace each image placeholder token with the right number of OOV sentinels.
+
+        Returns (expanded_ids, mm_token_lengths, mm_token_offsets).
+        """
+        placeholder_id = self.vocab_size + 1
+
+        expanded: List[int] = []
+        mm_token_lengths: List[int] = []
+        mm_token_offsets: List[int] = []
+        image_idx = 0
+        for tok in prompt_token_ids:
+            if tok == self.image_token_index:
+                if image_idx >= len(num_mm_tokens_per_placeholder):
+                    raise ValueError(
+                        f"More image placeholder tokens in prompt than "
+                        f"num_mm_tokens_per_placeholder entries: "
+                        f"found {image_idx + 1} placeholders, "
+                        f"have {len(num_mm_tokens_per_placeholder)} entries.")
+                n = num_mm_tokens_per_placeholder[image_idx]
+                mm_token_offsets.append(len(expanded))
+                expanded.extend([placeholder_id] * n)
+                mm_token_lengths.append(n)
+                image_idx += 1
+            else:
+                expanded.append(tok)
+
+        if image_idx != len(num_mm_tokens_per_placeholder):
+            raise ValueError(
+                f"Expected {len(num_mm_tokens_per_placeholder)} image "
+                f"placeholders, found {image_idx}.")
+        return expanded, mm_token_lengths, mm_token_offsets
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[int]:
+        """Expand MM placeholder tokens in pre-tokenised IDs.
+
+        Used by the ``tokenized_multimodal_process`` pipeline so that
+        Dynamo/serving can send ``prompt_token_ids`` (from the Rust
+        frontend, already containing single placeholder tokens) and raw
+        PIL images, without detokenising and re-tokenising.
+        """
+        expanded, _, _ = self._expand_image_placeholders_in_token_ids(
+            prompt_token_ids, num_mm_tokens_per_placeholder)
+        return expanded
+
     # -- Public API ----------------------------------------------------------
 
     def get_prompt_token_ids(
@@ -280,43 +371,13 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor,
 
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0]
-        vocab_size = self.config.text_config.vocab_size
-        image_token_index = self.image_token_index
-
-        image_mask = input_ids == image_token_index
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(mm_handles)
-        total_mm_tokens = sum(
-            mm_handle["tensor_size"][0] for mm_handle in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        placeholder_id = vocab_size + 1
-
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length: List[int] = []
-        mm_token_offsets: List[int] = []
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == image_token_index:
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos:write_pos + mm_token_num] = \
-                    placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        assert write_pos == final_length
-        assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length
-        return (
-            expanded_ids.to(torch.int32).tolist(),
-            mm_token_length,
-            mm_token_offsets,
-        )
+        num_mm_tokens = [
+            mm_handle["tensor_size"][0] for mm_handle in mm_handles
+        ]
+        expanded_ids, mm_token_length, mm_token_offsets = (
+            self._expand_image_placeholders_in_token_ids(
+                input_ids.tolist(), num_mm_tokens))
+        return expanded_ids, mm_token_length, mm_token_offsets
 
     def attach_multimodal_embeddings(
         self,
@@ -364,18 +425,38 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor,
                 {},
             )
 
-        # Process images via HF processor (trust_remote_code handles
-        # Kimi K2.5's custom kimi_k25_vision_processing.py)
         processed_values = self.processor(
-            text=text_prompt,
-            images=images,
-            do_rescale=not (images and isinstance(images[0], torch.Tensor)),
+            messages=[
+                {"role": "user", "content": [
+                    *[{"type": "image_url", "image_url": img}
+                      for img in images],
+                    {"type": "text", "text": text_prompt},
+                ]}
+            ],
             return_tensors="pt",
         )
 
-        fused_input_ids = processed_values['input_ids'][0]
-        fused_input_ids[
-            fused_input_ids == self.image_token_index] = self.vocab_size + 1
+        raw_ids = processed_values['input_ids'][0]
+        grid_thws = processed_values.get(
+            'grid_thws', processed_values.get('image_grid_thw'))
+        merge_k = getattr(
+            self.config.vision_config, 'merge_kernel_size', [2, 2])
+        num_mm_tokens_per_image = []
+        for t, h, w in grid_thws.tolist():
+            num_mm_tokens_per_image.append(
+                (h // merge_k[0]) * (w // merge_k[1]))
+
+        expanded_parts = []
+        img_idx = 0
+        for tok in raw_ids.tolist():
+            if tok == self.image_token_index:
+                n = num_mm_tokens_per_image[img_idx] \
+                    if img_idx < len(num_mm_tokens_per_image) else 1
+                expanded_parts.extend([self.vocab_size + 1] * n)
+                img_idx += 1
+            else:
+                expanded_parts.append(tok)
+        fused_input_ids = torch.tensor(expanded_parts, dtype=torch.int32)
 
         multimodal_data: Dict[str, Any] = {}
         multimodal_data["image"] = {
@@ -590,6 +671,9 @@ class KimiK25Model(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = (
             model_config.pretrained_config.text_config)
+        # Share extra_attrs so MLA layers register into the same dict
+        # the model engine reads from (deepcopy creates a separate dict).
+        llm_model_config.extra_attrs = model_config.extra_attrs
 
         # Ensure torch_dtype propagates to text sub-config
         if llm_model_config.pretrained_config.torch_dtype is None:
